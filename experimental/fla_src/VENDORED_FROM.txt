@@ -1,0 +1,7 @@
+Source repository: https://github.com/fla-org/flash-linear-attention
+Vendored commit: 39f2d4029eb29a16d963b39dda20a2a0cfdad0f7
+Vendored date: 2026-04-07
+
+Notes:
+- train_gpt.py loads KDA from this local copy when ATTN_IMPL=kda.
+- To modify KDA update rules, edit files under fla/ops/kda/.

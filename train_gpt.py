@@ -589,12 +589,17 @@ class CausalSelfAttention(nn.Module):
                     "ATTN_IMPL=kda does not use grouped-query KV heads. "
                     "Set NUM_KV_HEADS equal to NUM_HEADS."
                 )
+            vendored_fla_root = Path(__file__).resolve().parent / "experimental" / "fla_src"
+            vendored_fla_root_str = str(vendored_fla_root)
+            if vendored_fla_root.is_dir() and vendored_fla_root_str not in sys.path:
+                # Prefer local vendored FLA so KDA kernel edits in this repo are picked up directly.
+                sys.path.insert(0, vendored_fla_root_str)
             try:
-                from experimental.fla_kda import KimiDeltaAttention
+                from fla.layers.kda import KimiDeltaAttention
             except Exception as exc:  # pragma: no cover - import error depends on runtime deps.
                 raise RuntimeError(
                     "ATTN_IMPL=kda requires the flash-linear-attention dependencies "
-                    "(fla/flash-linear-attention package and its runtime deps)."
+                    "(vendored under experimental/fla_src or installed package) and runtime deps."
                 ) from exc
             self.kda = KimiDeltaAttention(
                 hidden_size=dim,
