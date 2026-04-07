@@ -68,8 +68,17 @@ class Hyperparameters:
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
     attn_impl = os.environ.get("ATTN_IMPL", "sdpa").lower()
     kda_mode = os.environ.get("KDA_MODE", "chunk")
-    kda_use_short_conv = bool(int(os.environ.get("KDA_USE_SHORT_CONV", "1")))
+    # Speed-first defaults for KDA experiments:
+    # - short conv off
+    # - safe gate on with lower bound for TensorCore-friendly fast path
+    # - disable_recompute on (higher memory, lower compute)
+    # - compile enabled with graph breaks allowed
+    kda_use_short_conv = bool(int(os.environ.get("KDA_USE_SHORT_CONV", "0")))
     kda_allow_neg_eigval = bool(int(os.environ.get("KDA_ALLOW_NEG_EIGVAL", "0")))
+    kda_safe_gate = bool(int(os.environ.get("KDA_SAFE_GATE", "1")))
+    kda_lower_bound = float(os.environ.get("KDA_LOWER_BOUND", "-5.0"))
+    kda_disable_recompute = bool(int(os.environ.get("KDA_DISABLE_RECOMPUTE", "1")))
+    kda_compile_model = bool(int(os.environ.get("KDA_COMPILE_MODEL", "1")))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -568,6 +577,9 @@ class CausalSelfAttention(nn.Module):
         kda_mode: str,
         kda_use_short_conv: bool,
         kda_allow_neg_eigval: bool,
+        kda_safe_gate: bool,
+        kda_lower_bound: float,
+        kda_disable_recompute: bool,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -589,6 +601,10 @@ class CausalSelfAttention(nn.Module):
                     "ATTN_IMPL=kda does not use grouped-query KV heads. "
                     "Set NUM_KV_HEADS equal to NUM_HEADS."
                 )
+            if kda_safe_gate and not (-5.0 <= kda_lower_bound < 0.0):
+                raise ValueError(
+                    f"KDA lower bound must be in [-5, 0) when KDA_SAFE_GATE=1; got {kda_lower_bound}."
+                )
             vendored_fla_root = Path(__file__).resolve().parent / "experimental" / "fla_src"
             vendored_fla_root_str = str(vendored_fla_root)
             if vendored_fla_root.is_dir() and vendored_fla_root_str not in sys.path:
@@ -609,7 +625,11 @@ class CausalSelfAttention(nn.Module):
                 mode=kda_mode,
                 use_short_conv=kda_use_short_conv,
                 allow_neg_eigval=kda_allow_neg_eigval,
+                safe_gate=kda_safe_gate,
+                lower_bound=kda_lower_bound,
+                disable_recompute=kda_disable_recompute,
             )
+            self.kda_disable_recompute = kda_disable_recompute
             self.kda.o_proj._zero_init = True
             return
 
@@ -682,6 +702,9 @@ class Block(nn.Module):
         kda_mode: str,
         kda_use_short_conv: bool,
         kda_allow_neg_eigval: bool,
+        kda_safe_gate: bool,
+        kda_lower_bound: float,
+        kda_disable_recompute: bool,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
@@ -696,6 +719,9 @@ class Block(nn.Module):
             kda_mode,
             kda_use_short_conv,
             kda_allow_neg_eigval,
+            kda_safe_gate,
+            kda_lower_bound,
+            kda_disable_recompute,
         )
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -729,6 +755,9 @@ class GPT(nn.Module):
         kda_mode: str,
         kda_use_short_conv: bool,
         kda_allow_neg_eigval: bool,
+        kda_safe_gate: bool,
+        kda_lower_bound: float,
+        kda_disable_recompute: bool,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -754,6 +783,9 @@ class GPT(nn.Module):
                     kda_mode,
                     kda_use_short_conv,
                     kda_allow_neg_eigval,
+                    kda_safe_gate,
+                    kda_lower_bound,
+                    kda_disable_recompute,
                 )
                 for i in range(num_layers)
             ]
@@ -913,13 +945,20 @@ def main() -> None:
         kda_mode=args.kda_mode,
         kda_use_short_conv=args.kda_use_short_conv,
         kda_allow_neg_eigval=args.kda_allow_neg_eigval,
+        kda_safe_gate=args.kda_safe_gate,
+        kda_lower_bound=args.kda_lower_bound,
+        kda_disable_recompute=args.kda_disable_recompute,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
     if args.attn_impl == "kda":
-        compiled_model = base_model
+        compiled_model = (
+            torch.compile(base_model, dynamic=False, fullgraph=False)
+            if args.kda_compile_model
+            else base_model
+        )
     else:
         compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
@@ -979,8 +1018,12 @@ def main() -> None:
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(
         f"attention_mode:{args.attn_impl} num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads} "
-        f"kda_mode:{args.kda_mode} kda_use_short_conv:{args.kda_use_short_conv}"
+        f"kda_mode:{args.kda_mode} kda_use_short_conv:{args.kda_use_short_conv} "
+        f"kda_safe_gate:{args.kda_safe_gate} kda_lower_bound:{args.kda_lower_bound} "
+        f"kda_disable_recompute:{args.kda_disable_recompute} kda_compile_model:{args.kda_compile_model}"
     )
+    if args.attn_impl == "kda":
+        log0(f"kda_chunk_size:{int(os.environ.get('KDA_CHUNK_SIZE', '64'))}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
