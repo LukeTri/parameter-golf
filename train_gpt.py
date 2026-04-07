@@ -66,6 +66,10 @@ class Hyperparameters:
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
+    attn_impl = os.environ.get("ATTN_IMPL", "sdpa").lower()
+    kda_mode = os.environ.get("KDA_MODE", "chunk")
+    kda_use_short_conv = bool(int(os.environ.get("KDA_USE_SHORT_CONV", "1")))
+    kda_allow_neg_eigval = bool(int(os.environ.get("KDA_ALLOW_NEG_EIGVAL", "0")))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -289,7 +293,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,A_log,dt_bias,skip_weight,skip_weights",
     ).split(",")
     if pattern
 )
@@ -560,17 +564,50 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
+        attn_impl: str,
+        kda_mode: str,
+        kda_use_short_conv: bool,
+        kda_allow_neg_eigval: bool,
     ):
         super().__init__()
         if dim % num_heads != 0:
             raise ValueError("model_dim must be divisible by num_heads")
         if num_heads % num_kv_heads != 0:
             raise ValueError("num_heads must be divisible by num_kv_heads")
+        if attn_impl not in {"sdpa", "kda"}:
+            raise ValueError(f"ATTN_IMPL must be one of ['sdpa', 'kda'], got {attn_impl}")
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = dim // num_heads
+        self.attn_impl = attn_impl
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
+
+        if self.attn_impl == "kda":
+            if num_kv_heads != num_heads:
+                raise ValueError(
+                    "ATTN_IMPL=kda does not use grouped-query KV heads. "
+                    "Set NUM_KV_HEADS equal to NUM_HEADS."
+                )
+            try:
+                from experimental.fla_kda import KimiDeltaAttention
+            except Exception as exc:  # pragma: no cover - import error depends on runtime deps.
+                raise RuntimeError(
+                    "ATTN_IMPL=kda requires the flash-linear-attention dependencies "
+                    "(fla/flash-linear-attention package and its runtime deps)."
+                ) from exc
+            self.kda = KimiDeltaAttention(
+                hidden_size=dim,
+                head_dim=self.head_dim,
+                num_heads=self.num_heads,
+                num_v_heads=self.num_heads,
+                mode=kda_mode,
+                use_short_conv=kda_use_short_conv,
+                allow_neg_eigval=kda_allow_neg_eigval,
+            )
+            self.kda.o_proj._zero_init = True
+            return
+
         kv_dim = self.num_kv_heads * self.head_dim
         self.c_q = CastedLinear(dim, dim, bias=False)
         self.c_k = CastedLinear(dim, kv_dim, bias=False)
@@ -581,6 +618,16 @@ class CausalSelfAttention(nn.Module):
         self.rotary = Rotary(self.head_dim, base=rope_base)
 
     def forward(self, x: Tensor) -> Tensor:
+        if self.attn_impl == "kda":
+            y, _, _ = self.kda(
+                hidden_states=x,
+                attention_mask=None,
+                past_key_values=None,
+                use_cache=False,
+                output_attentions=False,
+            )
+            return y
+
         bsz, seqlen, dim = x.shape
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
@@ -626,11 +673,25 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        attn_impl: str,
+        kda_mode: str,
+        kda_use_short_conv: bool,
+        kda_allow_neg_eigval: bool,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.attn = CausalSelfAttention(
+            dim,
+            num_heads,
+            num_kv_heads,
+            rope_base,
+            qk_gain_init,
+            attn_impl,
+            kda_mode,
+            kda_use_short_conv,
+            kda_allow_neg_eigval,
+        )
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -659,6 +720,10 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        attn_impl: str,
+        kda_mode: str,
+        kda_use_short_conv: bool,
+        kda_allow_neg_eigval: bool,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -680,6 +745,10 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    attn_impl,
+                    kda_mode,
+                    kda_use_short_conv,
+                    kda_allow_neg_eigval,
                 )
                 for i in range(num_layers)
             ]
@@ -835,12 +904,19 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        attn_impl=args.attn_impl,
+        kda_mode=args.kda_mode,
+        kda_use_short_conv=args.kda_use_short_conv,
+        kda_allow_neg_eigval=args.kda_allow_neg_eigval,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    if args.attn_impl == "kda":
+        compiled_model = base_model
+    else:
+        compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
@@ -896,7 +972,10 @@ def main() -> None:
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
-    log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0(
+        f"attention_mode:{args.attn_impl} num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads} "
+        f"kda_mode:{args.kda_mode} kda_use_short_conv:{args.kda_use_short_conv}"
+    )
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
