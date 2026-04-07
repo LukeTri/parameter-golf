@@ -93,7 +93,6 @@ class KimiDeltaAttention(nn.Module):
         allow_neg_eigval: bool = False,
         safe_gate: bool = False,
         lower_bound: float | None = None,
-        disable_recompute: bool = False,
         conv_size: int = 4,
         conv_bias: bool = False,
         layer_idx: int = None,
@@ -106,7 +105,6 @@ class KimiDeltaAttention(nn.Module):
         self.allow_neg_eigval = allow_neg_eigval
         self.safe_gate = safe_gate
         self.lower_bound = lower_bound
-        self.disable_recompute = disable_recompute
         self.hidden_size = hidden_size
         self.expand_v = expand_v
 
@@ -277,7 +275,6 @@ class KimiDeltaAttention(nn.Module):
                 use_gate_in_kernel=True,
                 safe_gate=self.safe_gate,
                 lower_bound=self.lower_bound,
-                disable_recompute=self.disable_recompute,
                 cu_seqlens=cu_seqlens,
             )
         elif mode == "fused_recurrent":

@@ -7,8 +7,6 @@
 
 # Related files are modified and supported by the Moonshot AI Team
 
-import os
-
 import torch
 
 from fla.modules.l2norm import l2norm_bwd, l2norm_fwd
@@ -46,9 +44,7 @@ class ChunkKDAFunction(torch.autograd.Function):
         cp_context: FLACPContext | None = None,
         transpose_state_layout: bool = False,
     ):
-        chunk_size = int(os.environ.get("KDA_CHUNK_SIZE", "64"))
-        if chunk_size <= 0:
-            raise ValueError(f"KDA_CHUNK_SIZE must be > 0, got {chunk_size}")
+        chunk_size = 64
 
         # Apply l2norm
         q_rstd, k_rstd = None, None
