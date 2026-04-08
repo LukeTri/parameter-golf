@@ -66,9 +66,12 @@ class Hyperparameters:
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
+    # Attention backends:
+    # - sdpa: original PyTorch scaled_dot_product_attention path
+    # - kda: full KimiDeltaAttention layer swap
     attn_impl = os.environ.get("ATTN_IMPL", "sdpa").lower()
     kda_mode = os.environ.get("KDA_MODE", "chunk")
-    kda_use_short_conv = bool(int(os.environ.get("KDA_USE_SHORT_CONV", "1")))
+    kda_use_short_conv = bool(int(os.environ.get("KDA_USE_SHORT_CONV", "0")))
     kda_allow_neg_eigval = bool(int(os.environ.get("KDA_ALLOW_NEG_EIGVAL", "0")))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
@@ -584,16 +587,16 @@ class CausalSelfAttention(nn.Module):
             raise ValueError("head_dim must be even for RoPE")
 
         if self.attn_impl == "kda":
-            if num_kv_heads != num_heads:
-                raise ValueError(
-                    "ATTN_IMPL=kda does not use grouped-query KV heads. "
-                    "Set NUM_KV_HEADS equal to NUM_HEADS."
-                )
             vendored_fla_root = Path(__file__).resolve().parent / "experimental" / "fla_src"
             vendored_fla_root_str = str(vendored_fla_root)
             if vendored_fla_root.is_dir() and vendored_fla_root_str not in sys.path:
                 # Prefer local vendored FLA so KDA kernel edits in this repo are picked up directly.
                 sys.path.insert(0, vendored_fla_root_str)
+            if num_kv_heads != num_heads:
+                raise ValueError(
+                    "ATTN_IMPL=kda does not use grouped-query KV heads. "
+                    "Set NUM_KV_HEADS equal to NUM_HEADS."
+                )
             try:
                 from fla.layers.kda import KimiDeltaAttention
             except Exception as exc:  # pragma: no cover - import error depends on runtime deps.
@@ -609,6 +612,8 @@ class CausalSelfAttention(nn.Module):
                 mode=kda_mode,
                 use_short_conv=kda_use_short_conv,
                 allow_neg_eigval=kda_allow_neg_eigval,
+                safe_gate=True,
+                lower_bound=-5.0,
             )
             self.kda.o_proj._zero_init = True
             return

@@ -275,6 +275,7 @@ class KimiDeltaAttention(nn.Module):
                 use_gate_in_kernel=True,
                 safe_gate=self.safe_gate,
                 lower_bound=self.lower_bound,
+                disable_recompute=True,
                 cu_seqlens=cu_seqlens,
             )
         elif mode == "fused_recurrent":
