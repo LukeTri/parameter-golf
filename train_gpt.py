@@ -73,6 +73,7 @@ class Hyperparameters:
     kda_mode = os.environ.get("KDA_MODE", "chunk")
     kda_use_short_conv = bool(int(os.environ.get("KDA_USE_SHORT_CONV", "0")))
     kda_allow_neg_eigval = bool(int(os.environ.get("KDA_ALLOW_NEG_EIGVAL", "0")))
+    kda_compile_model = bool(int(os.environ.get("KDA_COMPILE_MODEL", "1")))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -924,7 +925,11 @@ def main() -> None:
             module.float()
     restore_low_dim_params_to_fp32(base_model)
     if args.attn_impl == "kda":
-        compiled_model = base_model
+        compiled_model = (
+            torch.compile(base_model, dynamic=False, fullgraph=False)
+            if args.kda_compile_model
+            else base_model
+        )
     else:
         compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
@@ -984,7 +989,8 @@ def main() -> None:
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(
         f"attention_mode:{args.attn_impl} num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads} "
-        f"kda_mode:{args.kda_mode} kda_use_short_conv:{args.kda_use_short_conv}"
+        f"kda_mode:{args.kda_mode} kda_use_short_conv:{args.kda_use_short_conv} "
+        f"kda_compile_model:{args.kda_compile_model}"
     )
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
