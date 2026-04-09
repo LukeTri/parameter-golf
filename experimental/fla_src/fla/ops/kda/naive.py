@@ -18,13 +18,16 @@ def naive_recurrent_kda(
     scale: float | None = None,
     initial_state: torch.Tensor | None = None,
     output_final_state: bool = False,
+    compute_dtype: torch.dtype | None = None,
 ):
     dtype = v.dtype
     B, T, H, K, V = *q.shape, v.shape[-1]
     if scale is None:
         scale = K ** -0.5
 
-    q, k, v, g, beta = map(lambda x: x.to(torch.float), [q, k, v, g, beta])
+    if compute_dtype is None:
+        compute_dtype = q.dtype if q.is_floating_point() else torch.float32
+    q, k, v, g, beta = (x.to(compute_dtype) for x in (q, k, v, g, beta))
     q = q * scale
 
     S = k.new_zeros(B, H, K, V).to(q)
@@ -51,6 +54,7 @@ def naive_chunk_kda(
     initial_state: torch.Tensor | None = None,
     output_final_state: bool = False,
     chunk_size: int = 64,
+    compute_dtype: torch.dtype | None = None,
 ):
     dtype = v.dtype
     B, T, H, K, V = *q.shape, v.shape[-1]
@@ -60,14 +64,18 @@ def naive_chunk_kda(
         scale = K ** -0.5
     assert T % BT == 0
 
-    q, k, v, g, beta = map(lambda x: rearrange(x, 'b (n c) h ... -> b h n c ...', c=BT).to(torch.float), [q, k, v, g, beta])
+    if compute_dtype is None:
+        compute_dtype = q.dtype if q.is_floating_point() else torch.float32
+    q, k, v, g, beta = (
+        rearrange(x, 'b (n c) h ... -> b h n c ...', c=BT).to(compute_dtype) for x in (q, k, v, g, beta)
+    )
     q = q * scale
     g = g.cumsum(-2)
 
     # note that diagonal is masked.
     mask = torch.triu(torch.ones(BT, BT, dtype=torch.bool, device=q.device), diagonal=0)
 
-    A = torch.zeros(*q.shape[:-1], BT, dtype=torch.float, device=q.device)
+    A = torch.zeros(*q.shape[:-1], BT, dtype=q.dtype, device=q.device)
     for i in range(BT):
         k_i = k[..., i, :]
         g_i = g[..., i:i+1, :]
@@ -77,7 +85,7 @@ def naive_chunk_kda(
     A = -A.masked_fill(mask, 0)
     for i in range(1, BT):
         A[..., i, :i] = A[..., i, :i].clone() + (A[..., i, :, None].clone() * A[..., :, :i].clone()).sum(-2)
-    A = (A + torch.eye(BT, dtype=torch.float, device=q.device)) * beta[..., None, :]
+    A = (A + torch.eye(BT, dtype=q.dtype, device=q.device)) * beta[..., None, :]
 
     w = A @ (g.exp() * k)
     u = A @ v
@@ -90,7 +98,7 @@ def naive_chunk_kda(
     for i in range(0, NT):
         # [B, H, BT, ...]
         q_i, k_i, u_i, g_i, w_i = q[:, :, i], k[:, :, i], u[:, :, i], g[:, :, i], w[:, :, i]
-        A = torch.zeros(B, H, BT, BT, dtype=torch.float, device=q.device)
+        A = torch.zeros(B, H, BT, BT, dtype=q.dtype, device=q.device)
         for j in range(BT):
             k_j = k[:, :, i, j]
             g_j = g[:, :, i, j:j+1, :]

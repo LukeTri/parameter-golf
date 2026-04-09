@@ -65,6 +65,8 @@ class KimiDeltaAttention(nn.Module):
             `Unlocking State-Tracking in Linear RNNs Through Negative Eigenvalues <https://arxiv.org/abs/2411.12537>`_
         conv_size (int, Optional):
             The kernel size of the short convolution, only used when `use_short_conv` is `True`. Default: 4.
+        naive_chunk_size (int, Optional):
+            Chunk size used by `naive_chunk` mode. Must divide sequence length. Default: 64.
         conv_bias (bool, Optional):
             Whether to use bias in the short convolution, only used when `use_short_conv` is `True`. Default: `False`.
         safe_gate (bool, Optional):
@@ -94,6 +96,7 @@ class KimiDeltaAttention(nn.Module):
         safe_gate: bool = False,
         lower_bound: float | None = None,
         conv_size: int = 4,
+        naive_chunk_size: int = 64,
         conv_bias: bool = False,
         layer_idx: int = None,
         norm_eps: float = 1e-5,
@@ -110,6 +113,7 @@ class KimiDeltaAttention(nn.Module):
 
         self.use_short_conv = use_short_conv
         self.conv_size = conv_size
+        self.naive_chunk_size = naive_chunk_size
         self.conv_bias = conv_bias
 
         self.head_dim = head_dim
@@ -213,9 +217,12 @@ class KimiDeltaAttention(nn.Module):
         if mode not in {"naive_chunk", "naive_recurrent"}:
             mode = "fused_recurrent" if (q_len <= 64 and not self.training) else mode
         if self.training:
-            assert mode in {"chunk", "naive_chunk", "naive_recurrent"}, (
-                "Only chunk/naive modes are supported in training."
-            )
+            if mode == "naive_recurrent":
+                raise NotImplementedError(
+                    "naive_recurrent mode is intended for reference/inference only and is too memory-heavy for training. "
+                    "Use mode='naive_chunk' for train-time debugging."
+                )
+            assert mode in {"chunk", "naive_chunk"}, "Only chunk/naive_chunk modes are supported in training."
 
         last_state = get_layer_cache(self, past_key_values)
 
@@ -305,6 +312,8 @@ class KimiDeltaAttention(nn.Module):
                 beta=beta,
                 initial_state=recurrent_state,
                 output_final_state=use_cache,
+                chunk_size=self.naive_chunk_size,
+                compute_dtype=q.dtype,
             )
         elif mode == "naive_recurrent":
             if cu_seqlens is not None:
@@ -327,6 +336,7 @@ class KimiDeltaAttention(nn.Module):
                 beta=beta,
                 initial_state=recurrent_state,
                 output_final_state=use_cache,
+                compute_dtype=q.dtype,
             )
         elif mode == "fused_recurrent":
             g = fused_kda_gate(g=g, A_log=self.A_log, dt_bias=self.dt_bias, lower_bound=self.lower_bound)

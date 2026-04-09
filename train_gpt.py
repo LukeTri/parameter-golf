@@ -24,6 +24,7 @@ import sentencepiece as spm
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+import torch.utils.checkpoint as torch_checkpoint
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
@@ -72,9 +73,11 @@ class Hyperparameters:
     attn_impl = os.environ.get("ATTN_IMPL", "sdpa").lower()
     # KDA modes come from vendored fla.layers.kda (e.g., chunk, fused_recurrent, naive_chunk, naive_recurrent).
     kda_mode = os.environ.get("KDA_MODE", "chunk")
+    kda_naive_chunk_size = int(os.environ.get("KDA_NAIVE_CHUNK_SIZE", "32"))
     kda_use_short_conv = bool(int(os.environ.get("KDA_USE_SHORT_CONV", "1")))
     kda_allow_neg_eigval = bool(int(os.environ.get("KDA_ALLOW_NEG_EIGVAL", "0")))
     kda_compile_model = bool(int(os.environ.get("KDA_COMPILE_MODEL", "1")))
+    grad_checkpoint = bool(int(os.environ.get("GRAD_CHECKPOINT", "0")))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -612,6 +615,7 @@ class CausalSelfAttention(nn.Module):
                 num_heads=self.num_heads,
                 num_v_heads=self.num_heads,
                 mode=kda_mode,
+                naive_chunk_size=args.kda_naive_chunk_size,
                 use_short_conv=kda_use_short_conv,
                 allow_neg_eigval=kda_allow_neg_eigval,
                 safe_gate=True,
@@ -736,6 +740,7 @@ class GPT(nn.Module):
         kda_mode: str,
         kda_use_short_conv: bool,
         kda_allow_neg_eigval: bool,
+        grad_checkpoint: bool,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -743,6 +748,7 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.grad_checkpoint = grad_checkpoint
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -786,12 +792,18 @@ class GPT(nn.Module):
 
         # First half stores skips; second half reuses them in reverse order.
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            if self.grad_checkpoint and self.training:
+                x = torch_checkpoint.checkpoint(self.blocks[i], x, x0, use_reentrant=False)
+            else:
+                x = self.blocks[i](x, x0)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            if self.grad_checkpoint and self.training:
+                x = torch_checkpoint.checkpoint(self.blocks[self.num_encoder_layers + i], x, x0, use_reentrant=False)
+            else:
+                x = self.blocks[self.num_encoder_layers + i](x, x0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -920,6 +932,7 @@ def main() -> None:
         kda_mode=args.kda_mode,
         kda_use_short_conv=args.kda_use_short_conv,
         kda_allow_neg_eigval=args.kda_allow_neg_eigval,
+        grad_checkpoint=(args.grad_checkpoint or (args.attn_impl == "kda" and args.kda_mode.startswith("naive"))),
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -994,8 +1007,10 @@ def main() -> None:
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(
         f"attention_mode:{args.attn_impl} num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads} "
-        f"kda_mode:{args.kda_mode} kda_use_short_conv:{args.kda_use_short_conv} "
-        f"kda_compile_model:{args.kda_compile_model}"
+        f"kda_mode:{args.kda_mode} kda_naive_chunk_size:{args.kda_naive_chunk_size} "
+        f"kda_use_short_conv:{args.kda_use_short_conv} "
+        f"kda_compile_model:{args.kda_compile_model} "
+        f"grad_checkpoint:{args.grad_checkpoint or (args.attn_impl == 'kda' and args.kda_mode.startswith('naive'))}"
     )
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
