@@ -7,8 +7,11 @@
 
 from .chunk import chunk_kda
 from .fused_recurrent import fused_recurrent_kda
+from .naive import naive_chunk_kda, naive_recurrent_kda
 
 __all__ = [
     "chunk_kda",
     "fused_recurrent_kda",
+    "naive_chunk_kda",
+    "naive_recurrent_kda",
 ]

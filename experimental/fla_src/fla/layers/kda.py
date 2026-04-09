@@ -17,8 +17,8 @@ from torch.nn import functional as F
 
 from fla.layers.utils import get_layer_cache, get_unpad_data, index_first_axis, pad_input, update_layer_cache
 from fla.modules import FusedRMSNormGated, ShortConvolution
-from fla.ops.kda import chunk_kda, fused_recurrent_kda
-from fla.ops.kda.gate import fused_kda_gate
+from fla.ops.kda import chunk_kda, fused_recurrent_kda, naive_chunk_kda, naive_recurrent_kda
+from fla.ops.kda.gate import fused_kda_gate, naive_kda_gate, naive_kda_lowerbound_gate
 
 if TYPE_CHECKING:
     from transformers.processing_utils import Unpack
@@ -55,7 +55,7 @@ class KimiDeltaAttention(nn.Module):
             where `num_v_heads` must be divisible by `num_heads`. Default: `None`.
         mode (str, Optional):
             Which KDA kernel to use.
-            Currently available: `chunk` and `fused_recurrent`.
+            Currently available: `chunk`, `fused_recurrent`, `naive_chunk`, and `naive_recurrent`.
             Default: `chunk`.
         use_short_conv (bool, Optional):
             Whether to use short convolutions. Default: `True`.
@@ -138,7 +138,9 @@ class KimiDeltaAttention(nn.Module):
                 f"expand_v={expand_v} does not produce an integer value when multiplied by head_dim={head_dim}. "
                 f"Resulting head_v_dim would be {head_dim * expand_v}, which is invalid for FusedRMSNormGated.",
             )
-        assert mode in ["chunk", "fused_recurrent"], f"Not supported mode `{mode}`."
+        assert mode in ["chunk", "fused_recurrent", "naive_chunk", "naive_recurrent"], (
+            f"Not supported mode `{mode}`."
+        )
 
         self.q_proj = nn.Linear(hidden_size, self.key_dim, bias=False)
         self.k_proj = nn.Linear(hidden_size, self.key_dim, bias=False)
@@ -206,10 +208,14 @@ class KimiDeltaAttention(nn.Module):
             )
 
         batch_size, q_len, _ = hidden_states.shape
-        # change to inference mode.
-        mode = "fused_recurrent" if (q_len <= 64 and not self.training) else self.mode
+        # change to inference mode unless explicitly using a naive reference implementation.
+        mode = self.mode
+        if mode not in {"naive_chunk", "naive_recurrent"}:
+            mode = "fused_recurrent" if (q_len <= 64 and not self.training) else mode
         if self.training:
-            assert mode == "chunk", "Only chunk mode is supported in training."
+            assert mode in {"chunk", "naive_chunk", "naive_recurrent"}, (
+                "Only chunk/naive modes are supported in training."
+            )
 
         last_state = get_layer_cache(self, past_key_values)
 
@@ -277,6 +283,50 @@ class KimiDeltaAttention(nn.Module):
                 lower_bound=self.lower_bound,
                 disable_recompute=True,
                 cu_seqlens=cu_seqlens,
+            )
+        elif mode == "naive_chunk":
+            if cu_seqlens is not None:
+                raise NotImplementedError("naive_chunk mode does not support packed varlen sequences (cu_seqlens).")
+            if self.lower_bound is None:
+                g = naive_kda_gate(g=g, A_log=self.A_log, dt_bias=self.dt_bias, output_dtype=q.dtype)
+            else:
+                g = naive_kda_lowerbound_gate(
+                    g=g,
+                    A_log=self.A_log,
+                    dt_bias=self.dt_bias,
+                    lower_bound=self.lower_bound,
+                    output_dtype=q.dtype,
+                )
+            o, recurrent_state = naive_chunk_kda(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                initial_state=recurrent_state,
+                output_final_state=use_cache,
+            )
+        elif mode == "naive_recurrent":
+            if cu_seqlens is not None:
+                raise NotImplementedError("naive_recurrent mode does not support packed varlen sequences (cu_seqlens).")
+            if self.lower_bound is None:
+                g = naive_kda_gate(g=g, A_log=self.A_log, dt_bias=self.dt_bias, output_dtype=q.dtype)
+            else:
+                g = naive_kda_lowerbound_gate(
+                    g=g,
+                    A_log=self.A_log,
+                    dt_bias=self.dt_bias,
+                    lower_bound=self.lower_bound,
+                    output_dtype=q.dtype,
+                )
+            o, recurrent_state = naive_recurrent_kda(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                initial_state=recurrent_state,
+                output_final_state=use_cache,
             )
         elif mode == "fused_recurrent":
             g = fused_kda_gate(g=g, A_log=self.A_log, dt_bias=self.dt_bias, lower_bound=self.lower_bound)

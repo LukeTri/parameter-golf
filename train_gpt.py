@@ -70,8 +70,9 @@ class Hyperparameters:
     # - sdpa: original PyTorch scaled_dot_product_attention path
     # - kda: full KimiDeltaAttention layer swap
     attn_impl = os.environ.get("ATTN_IMPL", "sdpa").lower()
+    # KDA modes come from vendored fla.layers.kda (e.g., chunk, fused_recurrent, naive_chunk, naive_recurrent).
     kda_mode = os.environ.get("KDA_MODE", "chunk")
-    kda_use_short_conv = bool(int(os.environ.get("KDA_USE_SHORT_CONV", "0")))
+    kda_use_short_conv = bool(int(os.environ.get("KDA_USE_SHORT_CONV", "1")))
     kda_allow_neg_eigval = bool(int(os.environ.get("KDA_ALLOW_NEG_EIGVAL", "0")))
     kda_compile_model = bool(int(os.environ.get("KDA_COMPILE_MODEL", "1")))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
@@ -925,9 +926,13 @@ def main() -> None:
             module.float()
     restore_low_dim_params_to_fp32(base_model)
     if args.attn_impl == "kda":
+        use_naive_kda_mode = args.kda_mode.startswith("naive")
+        compile_kda_model = args.kda_compile_model and not use_naive_kda_mode
+        if args.kda_compile_model and use_naive_kda_mode:
+            log0("kda_compile_override:disabled_for_naive_mode")
         compiled_model = (
             torch.compile(base_model, dynamic=False, fullgraph=False)
-            if args.kda_compile_model
+            if compile_kda_model
             else base_model
         )
     else:
