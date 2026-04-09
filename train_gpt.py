@@ -574,6 +574,7 @@ class CausalSelfAttention(nn.Module):
         qk_gain_init: float,
         attn_impl: str,
         kda_mode: str,
+        kda_naive_chunk_size: int,
         kda_use_short_conv: bool,
         kda_allow_neg_eigval: bool,
     ):
@@ -615,7 +616,7 @@ class CausalSelfAttention(nn.Module):
                 num_heads=self.num_heads,
                 num_v_heads=self.num_heads,
                 mode=kda_mode,
-                naive_chunk_size=args.kda_naive_chunk_size,
+                naive_chunk_size=kda_naive_chunk_size,
                 use_short_conv=kda_use_short_conv,
                 allow_neg_eigval=kda_allow_neg_eigval,
                 safe_gate=True,
@@ -691,6 +692,7 @@ class Block(nn.Module):
         qk_gain_init: float,
         attn_impl: str,
         kda_mode: str,
+        kda_naive_chunk_size: int,
         kda_use_short_conv: bool,
         kda_allow_neg_eigval: bool,
     ):
@@ -705,6 +707,7 @@ class Block(nn.Module):
             qk_gain_init,
             attn_impl,
             kda_mode,
+            kda_naive_chunk_size,
             kda_use_short_conv,
             kda_allow_neg_eigval,
         )
@@ -738,6 +741,7 @@ class GPT(nn.Module):
         qk_gain_init: float,
         attn_impl: str,
         kda_mode: str,
+        kda_naive_chunk_size: int,
         kda_use_short_conv: bool,
         kda_allow_neg_eigval: bool,
         grad_checkpoint: bool,
@@ -765,6 +769,7 @@ class GPT(nn.Module):
                     qk_gain_init,
                     attn_impl,
                     kda_mode,
+                    kda_naive_chunk_size,
                     kda_use_short_conv,
                     kda_allow_neg_eigval,
                 )
@@ -930,6 +935,7 @@ def main() -> None:
         qk_gain_init=args.qk_gain_init,
         attn_impl=args.attn_impl,
         kda_mode=args.kda_mode,
+        kda_naive_chunk_size=args.kda_naive_chunk_size,
         kda_use_short_conv=args.kda_use_short_conv,
         kda_allow_neg_eigval=args.kda_allow_neg_eigval,
         grad_checkpoint=(args.grad_checkpoint or (args.attn_impl == "kda" and args.kda_mode.startswith("naive"))),
