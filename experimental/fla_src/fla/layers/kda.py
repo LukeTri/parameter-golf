@@ -55,7 +55,7 @@ class KimiDeltaAttention(nn.Module):
             where `num_v_heads` must be divisible by `num_heads`. Default: `None`.
         mode (str, Optional):
             Which KDA kernel to use.
-            Currently available: `chunk`, `fused_recurrent`, `naive_chunk`, and `naive_recurrent`.
+            Currently available: `chunk`, `chunk_stable`, `fused_recurrent`, `naive_chunk`, and `naive_recurrent`.
             Default: `chunk`.
         use_short_conv (bool, Optional):
             Whether to use short convolutions. Default: `True`.
@@ -81,6 +81,9 @@ class KimiDeltaAttention(nn.Module):
             The index of the layer. Default: None.
         norm_eps (float, Optional):
             The epsilon value for the normalization layer. Default: 1e-5.
+        stable_beta_eps (float, Optional):
+            Epsilon floor for beta when `mode='chunk_stable'` computes the value rescaling
+            ``(1 + beta) / beta``. Default: 1e-6.
     """
 
     def __init__(
@@ -100,6 +103,7 @@ class KimiDeltaAttention(nn.Module):
         conv_bias: bool = False,
         layer_idx: int = None,
         norm_eps: float = 1e-5,
+        stable_beta_eps: float = 1e-6,
         **kwargs,
     ) -> KimiDeltaAttention:
         super().__init__()
@@ -125,6 +129,7 @@ class KimiDeltaAttention(nn.Module):
         self.key_dim = int(self.num_heads * self.head_k_dim)
         self.value_dim = int(self.num_v_heads * self.head_v_dim)
         self.layer_idx = layer_idx
+        self.stable_beta_eps = stable_beta_eps
 
         # Consistency check: Ensure expand_v produces integer values
         if not math.isclose(self.num_v_heads * self.head_dim * expand_v, self.value_dim, rel_tol=1e-5):
@@ -142,7 +147,7 @@ class KimiDeltaAttention(nn.Module):
                 f"expand_v={expand_v} does not produce an integer value when multiplied by head_dim={head_dim}. "
                 f"Resulting head_v_dim would be {head_dim * expand_v}, which is invalid for FusedRMSNormGated.",
             )
-        assert mode in ["chunk", "fused_recurrent", "naive_chunk", "naive_recurrent"], (
+        assert mode in ["chunk", "chunk_stable", "fused_recurrent", "naive_chunk", "naive_recurrent"], (
             f"Not supported mode `{mode}`."
         )
 
@@ -214,8 +219,12 @@ class KimiDeltaAttention(nn.Module):
         batch_size, q_len, _ = hidden_states.shape
         # change to inference mode unless explicitly using a naive reference implementation.
         mode = self.mode
-        if mode not in {"naive_chunk", "naive_recurrent"}:
+        use_stable_recurrence = mode == "chunk_stable"
+        if mode not in {"naive_chunk", "naive_recurrent", "chunk_stable"}:
             mode = "fused_recurrent" if (q_len <= 64 and not self.training) else mode
+        if mode == "chunk_stable":
+            # Keep the stabilized recurrence active for short-sequence inference as well.
+            mode = "fused_recurrent" if (q_len <= 64 and not self.training) else "chunk"
         if self.training:
             if mode == "naive_recurrent":
                 raise NotImplementedError(
@@ -271,6 +280,22 @@ class KimiDeltaAttention(nn.Module):
 
         if self.allow_neg_eigval:
             beta = beta * 2.0
+
+        if use_stable_recurrence:
+            # Implements:
+            #   S_t = (I - gamma_t k_t k_t^T) S_{t-1} + c_t k_t v_t^T
+            # with gamma_t = beta_t / (1 + beta_t * ||k_t||^2),
+            # and c_t = (1 + beta_t) / (1 + beta_t * ||k_t||^2).
+            # The chunk kernel expects the form:
+            #   S_t = (I - beta k k^T) S_{t-1} + beta k v^T
+            # so we pass beta := gamma_t and v := ((1 + beta_t)/beta_t) * v_t.
+            beta_fp32 = beta.float()
+            k_sq = (k.float() * k.float()).sum(-1)
+            denom = 1.0 + beta_fp32 * k_sq
+            beta = (beta_fp32 / denom).to(beta.dtype)
+            beta_safe = beta_fp32.clamp_min(self.stable_beta_eps)
+            v_scale = ((1.0 + beta_fp32) / beta_safe).to(v.dtype)
+            v = v * v_scale[..., None]
 
         recurrent_state = last_state["recurrent_state"] if last_state is not None else None
         if mode == "chunk":

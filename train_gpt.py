@@ -71,7 +71,8 @@ class Hyperparameters:
     # - sdpa: original PyTorch scaled_dot_product_attention path
     # - kda: full KimiDeltaAttention layer swap
     attn_impl = os.environ.get("ATTN_IMPL", "sdpa").lower()
-    # KDA modes come from vendored fla.layers.kda (e.g., chunk, fused_recurrent, naive_chunk, naive_recurrent).
+    # KDA modes come from vendored fla.layers.kda
+    # (e.g., chunk, chunk_stable, fused_recurrent, naive_chunk, naive_recurrent).
     kda_mode = os.environ.get("KDA_MODE", "chunk")
     kda_naive_chunk_size = int(os.environ.get("KDA_NAIVE_CHUNK_SIZE", "32"))
     kda_use_short_conv = bool(int(os.environ.get("KDA_USE_SHORT_CONV", "1")))
