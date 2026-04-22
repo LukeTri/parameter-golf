@@ -1,6 +1,7 @@
 numpy
 tqdm
 torch
+einops
 huggingface-hub
 kernels
 setuptools
