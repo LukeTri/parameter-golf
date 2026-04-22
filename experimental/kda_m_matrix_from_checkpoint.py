@@ -11,6 +11,7 @@ This script:
 """
 
 import argparse
+import math
 import re
 from pathlib import Path
 
@@ -282,6 +283,7 @@ def _kda_forward_reference(
     o = _linear(o, o_proj_w)
 
     ctx = {
+        "q": q.detach(),
         "k": k.detach(),
         "g": g_log.detach(),
         "beta": beta.detach(),
@@ -501,6 +503,103 @@ def _chunk_affine_chain(
     return torch.stack(ms, dim=0), torch.stack(bs, dim=0)
 
 
+def _chunk_ut_token_matrices(
+    k: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    chunk_size: int,
+) -> torch.Tensor:
+    """Compute UT-form per-chunk token matrix M_[t] of shape [N_chunk, BH, C, C].
+
+    This corresponds to Eq. (6)/(7) style intra-chunk matrix used to map V -> U.
+    """
+    bsz, tlen, heads, key_dim = k.shape
+    bh = bsz * heads
+    if tlen % chunk_size != 0:
+        raise ValueError(
+            f"UT token matrix probe requires seq_len divisible by chunk_size, got {tlen} and {chunk_size}"
+        )
+    n_chunks = tlen // chunk_size
+    c = chunk_size
+
+    eye = torch.eye(c, device=k.device, dtype=k.dtype)
+    strict_upper_mask = torch.triu(torch.ones(c, c, dtype=torch.bool, device=k.device), diagonal=0)
+
+    out = []
+    for chunk_idx in range(n_chunks):
+        start = chunk_idx * c
+        end = start + c
+        # [BH, C, K], [BH, C, K], [BH, C]
+        k_c = k[:, start:end].permute(0, 2, 1, 3).reshape(bh, c, key_dim)
+        g_c = g[:, start:end].permute(0, 2, 1, 3).reshape(bh, c, key_dim)
+        beta_c = beta[:, start:end].permute(0, 2, 1).reshape(bh, c)
+
+        # Cumulative log-decay within chunk.
+        g_cum = torch.cumsum(g_c, dim=1)
+
+        # Build lower-triangular solve matrix using the same recurrence as naive_chunk_kda.
+        a = torch.zeros(bh, c, c, dtype=k.dtype, device=k.device)
+        for i in range(c):
+            k_i = k_c[:, i, :]          # [BH, K]
+            g_i = g_cum[:, i:i + 1, :]  # [BH, 1, K]
+            a[:, i, :] = torch.einsum("b c d, b d -> b c", k_c * torch.exp(g_cum - g_i), k_i)
+        a = a * beta_c[:, :, None]
+        a = -a.masked_fill(strict_upper_mask[None], 0)
+        for i in range(1, c):
+            a[:, i, :i] = a[:, i, :i] + (a[:, i, :, None] * a[:, :, :i]).sum(-2)
+        m = (a + eye[None]) * beta_c[:, None, :]
+        out.append(m)
+
+    return torch.stack(out, dim=0)
+
+
+def _local_chunk_cumsum_scaled(g: torch.Tensor, chunk_size: int, scale: float) -> torch.Tensor:
+    bsz, tlen, heads, dim = g.shape
+    out = torch.empty_like(g)
+    for start in range(0, tlen, chunk_size):
+        end = min(tlen, start + chunk_size)
+        out[:, start:end] = torch.cumsum(g[:, start:end], dim=1) * scale
+    return out
+
+
+def _chunk_ut_token_matrices_kernel(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    chunk_size: int,
+) -> torch.Tensor:
+    if not q.is_cuda:
+        raise RuntimeError("matrix-kind=ut_token_kernel currently requires CUDA.")
+    if q.shape[1] % chunk_size != 0:
+        raise ValueError(
+            f"ut_token_kernel requires seq_len divisible by chunk_size, got {q.shape[1]} and {chunk_size}"
+        )
+
+    from fla.ops.kda.chunk_intra import chunk_kda_fwd_intra
+
+    # chunk_kda_fwd_intra expects chunk-local cumsum in log2 space.
+    gk = _local_chunk_cumsum_scaled(g, chunk_size=chunk_size, scale=1.0 / math.log(2.0))
+    scale = q.shape[-1] ** -0.5
+    with torch.inference_mode():
+        _, _, _, _, _, akk = chunk_kda_fwd_intra(
+            q=q,
+            k=k,
+            v=v,
+            gk=gk,
+            beta=beta,
+            scale=scale,
+            chunk_size=chunk_size,
+            safe_gate=False,
+            disable_recompute=True,
+        )
+    # akk: [B, T, H, C] where rows are token index inside chunk, cols are chunk columns.
+    bsz, tlen, heads, c = akk.shape
+    n_chunks = tlen // c
+    return akk.view(bsz, n_chunks, c, heads, c).permute(1, 0, 3, 2, 4).reshape(n_chunks, bsz * heads, c, c)
+
+
 def _compose_chunks(
     m_chunks: torch.Tensor,
     b_chunks: torch.Tensor,
@@ -523,6 +622,19 @@ def _distance_profile(m: torch.Tensor) -> list[float]:
     profile = []
     for d in range(key_dim):
         vals = abs_m[:, dist == d]
+        profile.append(float(vals.mean().item()))
+    return profile
+
+
+def _lag_profile_lower(m: torch.Tensor) -> list[float]:
+    """Mean |M_ij| by causal lag l=i-j for lower-triangular token matrix."""
+    abs_m = m.abs()
+    c = abs_m.shape[-1]
+    idx = torch.arange(c, device=abs_m.device)
+    lag = idx[:, None] - idx[None, :]
+    profile = []
+    for l in range(c):
+        vals = abs_m[:, lag == l]
         profile.append(float(vals.mean().item()))
     return profile
 
@@ -577,38 +689,14 @@ def run(args: argparse.Namespace) -> None:
         )
 
     k = ctx["k"]
+    q = ctx["q"]
     g = ctx["g"]
     beta = ctx["beta"]
     v = ctx["v"]
 
-    m_chunks, b_chunks = _chunk_affine_chain(k, v, g, beta, args.chunk_size)
-    m_total, b_total = _compose_chunks(m_chunks, b_chunks)
-
     bh = args.batch * int(arch["num_heads"])
     key_dim = int(arch["head_k_dim"])
     value_dim = int(arch["head_v_dim"])
-    h0 = args.init_state_scale * torch.randn(bh, key_dim, value_dim, device=device, dtype=dtype)
-    s_pred = torch.matmul(m_total, h0) + b_total
-
-    q_dummy = torch.zeros_like(k)
-    _, s_ref = _naive_recurrent_kda(
-        q=q_dummy,
-        k=k,
-        v=v,
-        g=g,
-        beta=beta,
-        initial_state=h0.view(args.batch, int(arch["num_heads"]), key_dim, value_dim),
-        output_final_state=True,
-        compute_dtype=dtype,
-    )
-    s_ref = s_ref.view(bh, key_dim, value_dim)
-    max_err = float((s_ref - s_pred).abs().max().item())
-    mean_err = float((s_ref - s_pred).abs().mean().item())
-
-    chunk_profile = _distance_profile(m_chunks.reshape(-1, key_dim, key_dim))
-    full_profile = _distance_profile(m_total.reshape(-1, key_dim, key_dim))
-    chunk_violations = _count_monotonicity_violations(chunk_profile, tol=args.monotonic_tol)
-    full_violations = _count_monotonicity_violations(full_profile, tol=args.monotonic_tol)
 
     print("KDA M-matrix probe (trained checkpoint)")
     print(f"checkpoint={ckpt_path}")
@@ -621,33 +709,89 @@ def run(args: argparse.Namespace) -> None:
         f"use_short_conv={arch['use_short_conv']} "
         f"lower_bound={args.lower_bound} allow_neg_eigval={args.allow_neg_eigval}"
     )
-    print(f"state consistency (affine M vs recurrent): max_err={max_err:.3e} mean_err={mean_err:.3e}")
+    print(f"matrix_kind={args.matrix_kind}")
     print("")
 
-    max_dist = min(args.max_dist_to_print, key_dim)
-    print("Per-chunk M |M_ij| mean by distance d=|i-j|")
-    print("d\tmean_abs\tratio_to_diag")
-    diag0 = chunk_profile[0]
-    for d in range(max_dist):
-        ratio = chunk_profile[d] / diag0 if diag0 > 0 else float("nan")
-        print(f"{d}\t{chunk_profile[d]:.6e}\t{ratio:.6f}")
-    print(f"monotonic violations (tol={args.monotonic_tol}): {chunk_violations}/{key_dim - 1}")
-    print("")
+    if args.matrix_kind == "state":
+        m_chunks, b_chunks = _chunk_affine_chain(k, v, g, beta, args.chunk_size)
+        m_total, b_total = _compose_chunks(m_chunks, b_chunks)
 
-    print("Full-sequence M_total |M_ij| mean by distance d=|i-j|")
-    print("d\tmean_abs\tratio_to_diag")
-    diag0 = full_profile[0]
-    for d in range(max_dist):
-        ratio = full_profile[d] / diag0 if diag0 > 0 else float("nan")
-        print(f"{d}\t{full_profile[d]:.6e}\t{ratio:.6f}")
-    print(f"monotonic violations (tol={args.monotonic_tol}): {full_violations}/{key_dim - 1}")
+        h0 = args.init_state_scale * torch.randn(bh, key_dim, value_dim, device=device, dtype=dtype)
+        s_pred = torch.matmul(m_total, h0) + b_total
+
+        q_dummy = torch.zeros_like(k)
+        _, s_ref = _naive_recurrent_kda(
+            q=q_dummy,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            initial_state=h0.view(args.batch, int(arch["num_heads"]), key_dim, value_dim),
+            output_final_state=True,
+            compute_dtype=dtype,
+        )
+        s_ref = s_ref.view(bh, key_dim, value_dim)
+        max_err = float((s_ref - s_pred).abs().max().item())
+        mean_err = float((s_ref - s_pred).abs().mean().item())
+        print(f"state consistency (affine M vs recurrent): max_err={max_err:.3e} mean_err={mean_err:.3e}")
+        print("")
+
+        chunk_profile = _distance_profile(m_chunks.reshape(-1, key_dim, key_dim))
+        full_profile = _distance_profile(m_total.reshape(-1, key_dim, key_dim))
+        chunk_violations = _count_monotonicity_violations(chunk_profile, tol=args.monotonic_tol)
+        full_violations = _count_monotonicity_violations(full_profile, tol=args.monotonic_tol)
+
+        max_dist = min(args.max_dist_to_print, key_dim)
+        print("Per-chunk state-transition M |M_ij| mean by feature distance d=|i-j|")
+        print("d\tmean_abs\tratio_to_diag")
+        diag0 = chunk_profile[0]
+        for d in range(max_dist):
+            ratio = chunk_profile[d] / diag0 if diag0 > 0 else float("nan")
+            print(f"{d}\t{chunk_profile[d]:.6e}\t{ratio:.6f}")
+        print(f"monotonic violations (tol={args.monotonic_tol}): {chunk_violations}/{key_dim - 1}")
+        print("")
+
+        print("Full-sequence state-transition M_total |M_ij| mean by feature distance d=|i-j|")
+        print("d\tmean_abs\tratio_to_diag")
+        diag0 = full_profile[0]
+        for d in range(max_dist):
+            ratio = full_profile[d] / diag0 if diag0 > 0 else float("nan")
+            print(f"{d}\t{full_profile[d]:.6e}\t{ratio:.6f}")
+        print(f"monotonic violations (tol={args.monotonic_tol}): {full_violations}/{key_dim - 1}")
+        print("")
+
+        if args.preview_size > 0:
+            preview = min(args.preview_size, key_dim)
+            torch.set_printoptions(precision=4, sci_mode=True, linewidth=180)
+            first_chunk_first_head = m_chunks[0, 0, :preview, :preview].detach().cpu()
+            print(f"Preview first chunk state-transition M[0,0], top-left {preview}x{preview}:")
+            print(first_chunk_first_head)
+        return
+
+    # UT token matrix path (Eq. 6/7 style): M_[t] in R^{C x C}
+    c = args.chunk_size
+    if args.matrix_kind == "ut_token":
+        m_ut = _chunk_ut_token_matrices(k, g, beta, c)  # [N_chunk, BH, C, C]
+    else:
+        m_ut = _chunk_ut_token_matrices_kernel(q, k, v, g, beta, c)
+    ut_profile = _lag_profile_lower(m_ut.reshape(-1, c, c))
+    ut_violations = _count_monotonicity_violations(ut_profile, tol=args.monotonic_tol)
+
+    max_dist = min(args.max_dist_to_print, c)
+    print("Per-chunk UT M_[t] |M_ij| mean by token lag l=i-j (lower-triangular)")
+    print("l\tmean_abs\tratio_to_diag")
+    diag0 = ut_profile[0]
+    for l in range(max_dist):
+        ratio = ut_profile[l] / diag0 if diag0 > 0 else float("nan")
+        print(f"{l}\t{ut_profile[l]:.6e}\t{ratio:.6f}")
+    print(f"monotonic violations (tol={args.monotonic_tol}): {ut_violations}/{c - 1}")
     print("")
 
     if args.preview_size > 0:
-        preview = min(args.preview_size, key_dim)
+        preview = min(args.preview_size, c)
         torch.set_printoptions(precision=4, sci_mode=True, linewidth=180)
-        first_chunk_first_head = m_chunks[0, 0, :preview, :preview].detach().cpu()
-        print(f"Preview first chunk M[0,0], top-left {preview}x{preview}:")
+        first_chunk_first_head = m_ut[0, 0, :preview, :preview].detach().cpu()
+        print(f"Preview first chunk UT M_[0][0], top-left {preview}x{preview}:")
         print(first_chunk_first_head)
 
 
@@ -673,6 +817,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--l2norm-eps", type=float, default=1e-6)
     p.add_argument("--o-norm-eps", type=float, default=1e-5)
     p.add_argument("--init-state-scale", type=float, default=1.0)
+    p.add_argument(
+        "--matrix-kind",
+        type=str,
+        default="state",
+        choices=["state", "ut_token", "ut_token_kernel"],
+        help=(
+            "`state`: d_k x d_k state-transition M. "
+            "`ut_token`: C x C UT M_[t] from torch reference reconstruction. "
+            "`ut_token_kernel`: C x C UT M_[t] read from intra-chunk kernel output (CUDA)."
+        ),
+    )
 
     p.add_argument("--max-dist-to-print", type=int, default=16)
     p.add_argument("--preview-size", type=int, default=8)

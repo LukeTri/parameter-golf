@@ -47,8 +47,35 @@ cd "${ROOT_DIR}"
 : "${PROBE_CHUNK_SIZE:=64}"
 : "${PROBE_DEVICE:=auto}"
 : "${PROBE_DTYPE:=float32}"
+: "${PROBE_MATRIX_KIND:=ut_token}"
 : "${PROBE_TOKEN_OFFSET:=0}"
 : "${PROBE_LOWER_BOUND:=-5.0}"
+
+echo "==> Preflight: KDA import check"
+if ! "${PYTHON}" - <<'PY'
+import sys
+from pathlib import Path
+root = Path(".").resolve()
+vendored = root / "experimental" / "fla_src"
+if str(vendored) not in sys.path:
+    sys.path.insert(0, str(vendored))
+from fla.layers.kda import KimiDeltaAttention  # noqa: F401
+print("KDA import OK")
+PY
+then
+  echo "KDA import failed; installing fallback deps (einops, transformers) ..."
+  "${PYTHON}" -m pip install einops transformers
+  "${PYTHON}" - <<'PY'
+import sys
+from pathlib import Path
+root = Path(".").resolve()
+vendored = root / "experimental" / "fla_src"
+if str(vendored) not in sys.path:
+    sys.path.insert(0, str(vendored))
+from fla.layers.kda import KimiDeltaAttention  # noqa: F401
+print("KDA import OK after fallback install")
+PY
+fi
 
 echo "==> Checking dataset shards..."
 if ls "${DATA_PATH}"/fineweb_train_*.bin >/dev/null 2>&1; then
@@ -98,6 +125,7 @@ PROBE_ARGS=(
   --chunk-size "${PROBE_CHUNK_SIZE}"
   --device "${PROBE_DEVICE}"
   --dtype "${PROBE_DTYPE}"
+  --matrix-kind "${PROBE_MATRIX_KIND}"
   --lower-bound "${PROBE_LOWER_BOUND}"
   --token-offset "${PROBE_TOKEN_OFFSET}"
 )
