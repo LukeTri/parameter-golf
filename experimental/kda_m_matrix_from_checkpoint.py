@@ -13,6 +13,7 @@ This script:
 import argparse
 import math
 import re
+import sys
 from pathlib import Path
 
 import torch
@@ -576,6 +577,12 @@ def _chunk_ut_token_matrices_kernel(
         raise ValueError(
             f"ut_token_kernel requires seq_len divisible by chunk_size, got {q.shape[1]} and {chunk_size}"
         )
+
+    repo_root = Path(__file__).resolve().parents[1]
+    vendored_fla = repo_root / "experimental" / "fla_src"
+    vendored_fla_str = str(vendored_fla)
+    if vendored_fla.is_dir() and vendored_fla_str not in sys.path:
+        sys.path.insert(0, vendored_fla_str)
 
     from fla.ops.kda.chunk_intra import chunk_kda_fwd_intra
 
